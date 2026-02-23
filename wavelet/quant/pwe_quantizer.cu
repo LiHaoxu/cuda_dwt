@@ -11,7 +11,7 @@
 //        pwe_quantizer.cu -o pwe_quantizer
 //
 // Usage:
-//   ./pwe_quantizer <input.raw> <nx> <ny> <nz> <levels> <tolerance> [prefix]
+//   ./pwe_quantizer <input.raw> <nx> <ny> <nz> <tolerance> [levels] [prefix]
 
 #include "cdf97_3d_host.cu"   // brings in DWT/IDWT + cdf97_3d_kernel.cu
 #include "pwe_kernels.cu"
@@ -105,6 +105,21 @@ static double gpu_abs_max(const double* d_data, size_t n)
                            cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaFree(d_partial));
     return result;
+}
+
+// ============================================================================
+// Auto-select DWT levels based on the largest spatial dimension.
+//   >=512 → 6,  >=256 → 5,  >=128 → 4,  >=64 → 3,  >=32 → 2,  else → 1
+// ============================================================================
+static int auto_dwt_levels(int nx, int ny, int nz)
+{
+    int max_dim = std::max({nx, ny, (nz > 1) ? nz : 1});
+    if (max_dim >= 512) return 6;
+    if (max_dim >= 256) return 5;
+    if (max_dim >= 128) return 4;
+    if (max_dim >= 64)  return 3;
+    if (max_dim >= 32)  return 2;
+    return 1;
 }
 
 // ============================================================================
@@ -427,10 +442,13 @@ static PweResult pwe_quantize(double* d_data, double* d_orig,
 // ============================================================================
 int main(int argc, char* argv[])
 {
-    if (argc < 7) {
+    if (argc < 6) {
         std::fprintf(stderr,
-            "Usage: %s <input.raw> <nx> <ny> <nz> <levels> <tolerance> "
-            "[output_prefix]\n", argv[0]);
+            "Usage: %s <input.raw> <nx> <ny> <nz> <tolerance> "
+            "[levels] [output_prefix]\n"
+            "  levels: DWT decomposition depth (auto if omitted:\n"
+            "          >=512→6, >=256→5, >=128→4, >=64→3, >=32→2)\n",
+            argv[0]);
         return 1;
     }
 
@@ -438,8 +456,10 @@ int main(int argc, char* argv[])
     const int nx      = std::atoi(argv[2]);
     const int ny      = std::atoi(argv[3]);
     const int nz      = std::atoi(argv[4]);
-    const int levels  = std::atoi(argv[5]);
-    const double tol  = std::atof(argv[6]);
+    const double tol  = std::atof(argv[5]);
+    const int levels  = (argc > 6 && std::atoi(argv[6]) > 0)
+                        ? std::atoi(argv[6])
+                        : auto_dwt_levels(nx, ny, nz);
     const std::string prefix = (argc > 7) ? argv[7] : "pwe_out";
 
     const size_t total = size_t(nx) * ny * nz;
@@ -485,9 +505,9 @@ int main(int argc, char* argv[])
     PweResult res = pwe_quantize(d_data, d_orig, cfg);
 
     // --- Save output files ---
-    std::string coeff_path   = prefix + "_coefficients.raw";
-    std::string sign_path    = prefix + "_signs.raw";
-    std::string outlier_path = prefix + "_outliers.raw";
+    std::string coeff_path   = prefix + "_coefficients.bin";
+    std::string sign_path    = prefix + "_signs.bin";
+    std::string outlier_path = prefix + "_outliers.bin";
 
     save_coefficients(coeff_path, res);
     save_signs(sign_path, res);

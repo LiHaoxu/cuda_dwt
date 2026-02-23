@@ -27,14 +27,16 @@ void dwt3d_forward(double* data,
                    const int levels,
                    const int ldx, const int ldy,
                    cudaStream_t stream) {
+    const bool is2d = (nz <= 1);
+
     for (int lev = 0; lev < levels; ++lev) {
         const int nx_l = nx >> lev;
         const int ny_l = ny >> lev;
-        const int nz_l = nz >> lev;
+        const int nz_l = is2d ? 1 : (nz >> lev);
         const int step = 1 << lev;
 
-        // Nothing to transform if any dimension is < 2.
-        if (nx_l < 2 || ny_l < 2 || nz_l < 2) break;
+        if (nx_l < 2 || ny_l < 2) break;
+        if (!is2d && nz_l < 2) break;
 
         // ---- X pass ----
         {
@@ -61,8 +63,8 @@ void dwt3d_forward(double* data,
                     data, nx_l, ny_l, nz_l, step, ldx, ldy);
         }
 
-        // ---- Z pass ----
-        {
+        // ---- Z pass (skip entirely for 2D data) ----
+        if (!is2d) {
             const dim3 grid(DivCeil(nx_l, COMPUTE_X),
                             DivCeil(nz_l, VALID_PER_TILE),
                             ny_l);
@@ -87,16 +89,19 @@ void dwt3d_inverse(double* data,
                    cudaStream_t stream) {
     // Inverse processes levels in reverse order.
     // Within each level the axis order is reversed: Z → Y → X.
+    const bool is2d = (nz <= 1);
+
     for (int lev = levels - 1; lev >= 0; --lev) {
         const int nx_l = nx >> lev;
         const int ny_l = ny >> lev;
-        const int nz_l = nz >> lev;
+        const int nz_l = is2d ? 1 : (nz >> lev);
         const int step = 1 << lev;
 
-        if (nx_l < 2 || ny_l < 2 || nz_l < 2) continue;
+        if (nx_l < 2 || ny_l < 2) continue;
+        if (!is2d && nz_l < 2) continue;
 
-        // ---- Z pass (inverse) ----
-        {
+        // ---- Z pass (inverse, skip entirely for 2D data) ----
+        if (!is2d) {
             const dim3 grid(DivCeil(nx_l, COMPUTE_X),
                             DivCeil(nz_l, VALID_PER_TILE),
                             ny_l);
