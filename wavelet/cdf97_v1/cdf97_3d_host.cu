@@ -1,26 +1,17 @@
-// wavelet/cdf97_3d_host.cu  —  Multilevel dispatch for 3-D CDF 9/7 DWT
-//
-// Compilation (single-TU approach — kernel templates are included):
-//   nvcc -std=c++17 -O2 cdf97_3d_host.cu -o dwt3d_test
-//
-// The file #includes the kernel source so that template bodies are visible
-// at the <<<>>> launch sites without requiring CUDA separate compilation.
 
-#include "cdf97_3d_kernel.cu"       // brings in cdf97_3d.cuh transitively
+
+#include "cdf97_3d_kernel.cu"       
 
 #include <algorithm>
 #include <cstdio>
 
 namespace wavelet {
 
-// ---- Utility: integer ceiling division ----
+
 static inline int DivCeil(const int a, const int b) {
     return (a + b - 1) / b;
 }
 
-// =============================================================================
-// dwt3d_forward  —  public entry point
-// =============================================================================
 
 void dwt3d_forward(double* data,
                    const int nx, const int ny, const int nz,
@@ -63,7 +54,7 @@ void dwt3d_forward(double* data,
                     data, nx_l, ny_l, nz_l, step, ldx, ldy);
         }
 
-        // ---- Z pass (skip entirely for 2D data) ----
+        // ---- Z pass ----
         if (!is2d) {
             const dim3 grid(DivCeil(nx_l, COMPUTE_X),
                             DivCeil(nz_l, VALID_PER_TILE),
@@ -78,17 +69,14 @@ void dwt3d_forward(double* data,
     }
 }
 
-// =============================================================================
-// dwt3d_inverse  —  public entry point (synthesis / reconstruction)
-// =============================================================================
+
 
 void dwt3d_inverse(double* data,
                    const int nx, const int ny, const int nz,
                    const int levels,
                    const int ldx, const int ldy,
                    cudaStream_t stream) {
-    // Inverse processes levels in reverse order.
-    // Within each level the axis order is reversed: Z → Y → X.
+
     const bool is2d = (nz <= 1);
 
     for (int lev = levels - 1; lev >= 0; --lev) {
@@ -100,7 +88,7 @@ void dwt3d_inverse(double* data,
         if (nx_l < 2 || ny_l < 2) continue;
         if (!is2d && nz_l < 2) continue;
 
-        // ---- Z pass (inverse, skip entirely for 2D data) ----
+        // ---- Z pass  ----
         if (!is2d) {
             const dim3 grid(DivCeil(nx_l, COMPUTE_X),
                             DivCeil(nz_l, VALID_PER_TILE),
@@ -113,7 +101,7 @@ void dwt3d_inverse(double* data,
                     data, nx_l, ny_l, nz_l, step, ldx, ldy);
         }
 
-        // ---- Y pass (inverse) ----
+        // ---- Y pass  ----
         {
             const dim3 grid(DivCeil(nx_l, COMPUTE_X),
                             DivCeil(ny_l, VALID_PER_TILE),
@@ -126,7 +114,7 @@ void dwt3d_inverse(double* data,
                     data, nx_l, ny_l, nz_l, step, ldx, ldy);
         }
 
-        // ---- X pass (inverse) ----
+        // ---- X pass  ----
         {
             const dim3 grid(DivCeil(nx_l, COMPUTE_X),
                             DivCeil(ny_l, TILE_Y),
@@ -140,4 +128,4 @@ void dwt3d_inverse(double* data,
     }
 }
 
-}  // namespace wavelet
+}  
