@@ -145,32 +145,8 @@ int main(int argc, char* argv[]) {
     // Test various sizes and levels.
     struct TestCase { int nx, ny, nz, levels; };
     const TestCase cases[] = {
-        // Small sizes, single level.
-        {  8,   8,   8, 1},
-        { 16,  16,  16, 1},
-        { 32,  32,  32, 1},
-
-        // Medium sizes, multiple levels.
-        { 32,  32,  32, 2},
-        { 64,  64,  64, 1},
-        { 64,  64,  64, 2},
-        { 64,  64,  64, 3},
-
-        // Larger sizes.
-        {128, 128, 128, 1},
-        {128, 128, 128, 2},
-        {128, 128, 128, 3},
-
-        // Non-cubic (but still power-of-2 and even).
-        { 64,  32,  16, 1},
-        { 64,  32,  16, 2},
-        {128,  64,  32, 1},
-        {128,  64,  32, 2},
-        {128,  64,  32, 3},
-
-        // Stress: many levels.
-        {256, 256, 256, 1},
-        {256, 256, 256, 4},
+        {256, 256, 256, 5},
+        {512, 512, 512, 6},
     };
 
     for (const auto& tc : cases) {

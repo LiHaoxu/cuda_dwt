@@ -1,15 +1,31 @@
-
 #include "cdf97_3d.cuh"
 
 namespace wavelet {
 
-//X
+// =============================================================================
+// X-direction FORWARD pass kernel  (analysis)
+// =============================================================================
+//
+// Shared-memory tile:  s[T_Y][T_X]  =  s[16][33]
+//   cols 0..31   — 32 compute points (16 even + 16 odd, pe=2k, po=2k+1)
+//   col  32      — bank-conflict padding (never read during lifting)
+//
+// Grid:  (ceil(NX_L/32), ceil(NY_L/16), NZ_L)
+// Block: (256, 1, 1)
+// Thread mapping for compute:  row = tid/16,  k = tid%16  → 256 = 16×16
+//
+// Boundary clamp (tile-internal, no halo):
+//   predict:  left = even[k] (always valid),
+//             right = even[k+1] (k<15) or even[k] (k=15)
+//   update:   right = odd[k] (always valid),
+//             left = odd[k-1] (k>0) or odd[k] (k=0)
+
 template <int COMP_X, int T_X, int T_Y, int BLK_SIZE>
 __global__ void dwt3d_x_pass(double* __restrict__ data,
                               const int nx_l, const int ny_l, const int nz_l,
                               const int step,
                               const int ldx, const int ldy) {
-
+    // 32 data columns, no halo.
     static constexpr int DATA_COLS = COMP_X;  // 32
 
     __shared__ double s[T_Y][T_X];
@@ -19,10 +35,10 @@ __global__ void dwt3d_x_pass(double* __restrict__ data,
     const int tile_start_y = static_cast<int>(blockIdx.y) * T_Y;
     const int iz           = static_cast<int>(blockIdx.z);
 
-    // Number of valid data columns in this tile 
+    // Number of valid data columns in this tile (may be < 32 for the last tile).
     const int n_valid_x = min(COMP_X, nx_l - tile_start_x);
 
-    // LOAD: global → shared
+    // ---- LOAD: global → shared (32 cols × 16 rows = 512 elements) ----
     for (int idx = tid; idx < T_Y * DATA_COLS; idx += BLK_SIZE) {
         const int sy = idx / DATA_COLS;
         const int sx = idx - sy * DATA_COLS;          // idx % DATA_COLS
@@ -36,7 +52,17 @@ __global__ void dwt3d_x_pass(double* __restrict__ data,
     }
     __syncthreads();
 
-
+    // ---- COMPUTE: 5-step CDF 9/7 lifting (in shared memory) ----
+    //
+    // even[k] ≡ s[row][2k]      (k = 0..15,  shared cols 0,2,4,…,30)
+    // odd[k]  ≡ s[row][2k+1]    (k = 0..15,  shared cols 1,3,5,…,31)
+    //
+    // n_valid_x guards: only positions < n_valid_x participate in lifting.
+    // Boundary clamp (within valid range):
+    //   predict:  left = even[k] (always valid when po < n_valid_x),
+    //             right = even[k+1] if po+1 < n_valid_x, else mirror left
+    //   update:   right = odd[k] if pe+1 < n_valid_x, else mirror left,
+    //             left = odd[k-1] if pe > 0, else mirror right
 
     const int row = tid >> 4;           // 0..15
     const int k   = tid & 0xF;         // 0..15
@@ -84,7 +110,7 @@ __global__ void dwt3d_x_pass(double* __restrict__ data,
     }
     __syncthreads();
 
-    // STORE: shared → global 
+    // ---- STORE: shared → global (in-place even/odd) ----
     const int ly = tile_start_y + row;
     if (ly < ny_l) {
         const int gy = ly * step;
@@ -101,14 +127,37 @@ __global__ void dwt3d_x_pass(double* __restrict__ data,
     }
 }
 
+// =============================================================================
+// Y/Z-direction FORWARD pass kernel  (analysis, template on Axis)
+// =============================================================================
+//
+// Reuses the SAME 33×16 tile as the X pass, with swapped semantics:
+//
+//   Shared memory:  s[T_Y][T_X]  =  s[16][33]
+//     row (T_Y=16) = Y/Z compute direction
+//       rows 0..14 — 15 valid output points (VPT)
+//       row  15    — padding (unused)
+//     col (T_X=33) = X batch direction
+//       cols 0..31 — 32 X batch positions
+//       col  32    — bank-conflict padding
+//
+// No halo: boundary extension via tile-internal mirror clamp.
+//
+// Grid (Y pass):  (ceil(NX_L/32), ceil(NY_L/15), NZ_L)
+// Grid (Z pass):  (ceil(NX_L/32), ceil(NZ_L/15), NY_L)
+// Block: (256, 1, 1)
+//
+// Thread mapping:
+//   Load / Store:  loop over elements
+//   Compute:  x_base = tid & 0xF (0..15),  yz_idx = tid >> 4 (0..15)
+//             each thread loops x = x_base, x_base+16 to cover 32 columns
 
-//Y/Z
 template <Axis AXIS, int T_X, int T_Y, int VPT, int BLK_SIZE>
 __global__ void dwt3d_yz_pass(double* __restrict__ data,
                                const int nx_l, const int ny_l, const int nz_l,
                                const int step,
                                const int ldx, const int ldy) {
-    // X batch size = T_X − 1 
+    // X batch size = T_X − 1 (last column is bank padding).
     static constexpr int X_BATCH = T_X - 1;  // 32
 
     __shared__ double s[T_Y][T_X];
@@ -121,8 +170,8 @@ __global__ void dwt3d_yz_pass(double* __restrict__ data,
     const int n_compute    = (AXIS == Axis::kY) ? ny_l : nz_l;
     const int tile_c_start = tile_c_idx * VPT;  // first output's logical index
 
-    //  LOAD: global → shared 
-
+    // ---- LOAD: global → shared (T_Y × T_X = 528 elements) ----
+    // No halo: lc = tile_c_start + yz_in_tile  (no −1 offset).
     for (int idx = tid; idx < T_Y * T_X; idx += BLK_SIZE) {
         const int x_in_tile  = idx % T_X;          // 0..32
         const int yz_in_tile = idx / T_X;          // 0..15
@@ -144,35 +193,53 @@ __global__ void dwt3d_yz_pass(double* __restrict__ data,
     }
     __syncthreads();
 
-//compute
-    const int x      = tid % T_X;          // 0..32
-    const int yz_idx = tid / T_X;          // 0..7  (256/33 ≈ 7.75)
+    // ---- COMPUTE: 5-step CDF 9/7 lifting along Y/Z (row direction) ----
+    //
+    // Thread mapping: x_base = tid & 0xF (0..15), yz_idx = tid >> 4 (0..15).
+    //   Each thread loops x = x_base, x_base+16 to cover all 32 data columns.
+    //
+    // Parity: global_index(row r) = tile_c_start + r.
+    //   If tile_c_start is even: row 0 is globally even, row 1 is globally odd, ...
+    //   If tile_c_start is odd:  row 0 is globally odd,  row 1 is globally even, ...
+    //
+    // Boundary clamp (tile-internal mirror):
+    //   left  = (tc > 0)          ? s[tc-1][x] : s[tc+1][x]
+    //   right = (tc < n_valid-1)  ? s[tc+1][x] : left
 
-    const bool x_active = (x < X_BATCH) && (tile_x_start + x < nx_l);
+    const int x_base = tid & 0xF;          // 0..15
+    const int yz_idx = tid >> 4;           // 0..15
 
-    const int first_parity = tile_c_start & 1;            // row 0's global parity
-    const int first_odd    = (first_parity == 1) ? 0 : 1; // first globally-odd row
-    const int first_even   = (first_parity == 0) ? 0 : 1; // first globally-even row
+    const int first_parity = tile_c_start & 1;
+    const int first_odd    = (first_parity == 1) ? 0 : 1;
+    const int first_even   = (first_parity == 0) ? 0 : 1;
     const int n_valid      = min(VPT, n_compute - tile_c_start);
 
-    // Step 1  predict 
+    // Step 1  predict (globally-odd)
     {
         const int tc = first_odd + 2 * yz_idx;
-        if (x_active && tc < n_valid) {
-            double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
-            double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
-            s[tc][x] += ALPHA * (left + right);
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l) {
+                    double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
+                    double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
+                    s[tc][x] += ALPHA * (left + right);
+                }
+            }
         }
     }
     __syncthreads();
 
-    // Step 2  update
+    // Step 2  update (globally-even)
     {
         const int tc = first_even + 2 * yz_idx;
-        if (x_active && tc < n_valid) {
-            double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
-            double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
-            s[tc][x] += BETA * (left + right);
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l) {
+                    double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
+                    double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
+                    s[tc][x] += BETA * (left + right);
+                }
+            }
         }
     }
     __syncthreads();
@@ -180,10 +247,14 @@ __global__ void dwt3d_yz_pass(double* __restrict__ data,
     // Step 3  predict
     {
         const int tc = first_odd + 2 * yz_idx;
-        if (x_active && tc < n_valid) {
-            double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
-            double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
-            s[tc][x] += GAMMA * (left + right);
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l) {
+                    double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
+                    double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
+                    s[tc][x] += GAMMA * (left + right);
+                }
+            }
         }
     }
     __syncthreads();
@@ -191,10 +262,14 @@ __global__ void dwt3d_yz_pass(double* __restrict__ data,
     // Step 4  update + scale
     {
         const int tc = first_even + 2 * yz_idx;
-        if (x_active && tc < n_valid) {
-            double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
-            double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
-            s[tc][x] = K_SCALE * (s[tc][x] + DELTA * (left + right));
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l) {
+                    double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
+                    double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
+                    s[tc][x] = K_SCALE * (s[tc][x] + DELTA * (left + right));
+                }
+            }
         }
     }
     __syncthreads();
@@ -202,12 +277,16 @@ __global__ void dwt3d_yz_pass(double* __restrict__ data,
     // Step 5  scale odd
     {
         const int tc = first_odd + 2 * yz_idx;
-        if (x_active && tc < n_valid)
-            s[tc][x] *= -INV_K_SCALE;
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l)
+                    s[tc][x] *= -INV_K_SCALE;
+            }
+        }
     }
     __syncthreads();
 
-    //STORE: shared → global 
+    // ---- STORE: shared → global (all valid output rows) ----
     for (int idx = tid; idx < X_BATCH * n_valid; idx += BLK_SIZE) {
         const int sx       = idx % X_BATCH;          // 0..31
         const int yz_store = idx / X_BATCH;          // 0..n_valid-1
@@ -226,7 +305,14 @@ __global__ void dwt3d_yz_pass(double* __restrict__ data,
     }
 }
 
-//X inverse
+// =============================================================================
+// X-direction INVERSE pass kernel  (synthesis / reconstruction)
+// =============================================================================
+//
+// Identical tile layout and load/store as dwt3d_x_pass.
+// Same boundary clamp rules.  Only the 5 lifting steps are reversed:
+//   fwd:  predict(α) → update(β) → predict(γ) → update+scale(δ,K) → scale(-1/K)
+//   inv:  unscale(-K) → unscale+update(1/K,-δ) → predict(-γ) → update(-β) → predict(-α)
 
 template <int COMP_X, int T_X, int T_Y, int BLK_SIZE>
 __global__ void idwt3d_x_pass(double* __restrict__ data,
@@ -245,6 +331,7 @@ __global__ void idwt3d_x_pass(double* __restrict__ data,
     // Number of valid data columns in this tile.
     const int n_valid_x = min(COMP_X, nx_l - tile_start_x);
 
+    // ---- LOAD: global → shared (identical to forward) ----
     for (int idx = tid; idx < T_Y * DATA_COLS; idx += BLK_SIZE) {
         const int sy = idx / DATA_COLS;
         const int sx = idx - sy * DATA_COLS;
@@ -258,7 +345,7 @@ __global__ void idwt3d_x_pass(double* __restrict__ data,
     }
     __syncthreads();
 
-//compute
+    // ---- COMPUTE: 5-step INVERSE CDF 9/7 lifting ----
     const int row = tid >> 4;
     const int k   = tid & 0xF;
 
@@ -305,6 +392,7 @@ __global__ void idwt3d_x_pass(double* __restrict__ data,
     }
     __syncthreads();
 
+    // ---- STORE: shared → global (identical to forward) ----
     const int ly = tile_start_y + row;
     if (ly < ny_l) {
         const int gy = ly * step;
@@ -321,7 +409,12 @@ __global__ void idwt3d_x_pass(double* __restrict__ data,
     }
 }
 
-//YZ inverse
+// =============================================================================
+// Y/Z-direction INVERSE pass kernel  (synthesis / reconstruction)
+// =============================================================================
+//
+// Identical tile layout and load/store as dwt3d_yz_pass.
+// Same boundary clamp rules.  Only the lifting steps are reversed.
 
 template <Axis AXIS, int T_X, int T_Y, int VPT, int BLK_SIZE>
 __global__ void idwt3d_yz_pass(double* __restrict__ data,
@@ -340,6 +433,7 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
     const int n_compute    = (AXIS == Axis::kY) ? ny_l : nz_l;
     const int tile_c_start = tile_c_idx * VPT;
 
+    // ---- LOAD: global → shared (identical to forward) ----
     for (int idx = tid; idx < T_Y * T_X; idx += BLK_SIZE) {
         const int x_in_tile  = idx % T_X;
         const int yz_in_tile = idx / T_X;
@@ -361,11 +455,9 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
     }
     __syncthreads();
 
-//compute
-    const int x      = tid % T_X;
-    const int yz_idx = tid / T_X;
-
-    const bool x_active = (x < X_BATCH) && (tile_x_start + x < nx_l);
+    // ---- COMPUTE: 5-step INVERSE CDF 9/7 lifting along Y/Z ----
+    const int x_base = tid & 0xF;          // 0..15
+    const int yz_idx = tid >> 4;           // 0..15
 
     const int first_parity = tile_c_start & 1;
     const int first_odd    = (first_parity == 1) ? 0 : 1;
@@ -375,18 +467,26 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
     // Inv-step 1  (undo fwd-step 5):  odd *= −K
     {
         const int tc = first_odd + 2 * yz_idx;
-        if (x_active && tc < n_valid)
-            s[tc][x] *= -K_SCALE;
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l)
+                    s[tc][x] *= -K_SCALE;
+            }
+        }
     }
     __syncthreads();
 
     // Inv-step 2  (undo fwd-step 4):  even = even/K − δ·(odd_left+odd_right)
     {
         const int tc = first_even + 2 * yz_idx;
-        if (x_active && tc < n_valid) {
-            double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
-            double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
-            s[tc][x] = INV_K_SCALE * s[tc][x] - DELTA * (left + right);
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l) {
+                    double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
+                    double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
+                    s[tc][x] = INV_K_SCALE * s[tc][x] - DELTA * (left + right);
+                }
+            }
         }
     }
     __syncthreads();
@@ -394,10 +494,14 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
     // Inv-step 3  (undo fwd-step 3):  odd −= γ·(even_left+even_right)
     {
         const int tc = first_odd + 2 * yz_idx;
-        if (x_active && tc < n_valid) {
-            double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
-            double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
-            s[tc][x] -= GAMMA * (left + right);
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l) {
+                    double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
+                    double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
+                    s[tc][x] -= GAMMA * (left + right);
+                }
+            }
         }
     }
     __syncthreads();
@@ -405,10 +509,14 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
     // Inv-step 4  (undo fwd-step 2):  even −= β·(odd_left+odd_right)
     {
         const int tc = first_even + 2 * yz_idx;
-        if (x_active && tc < n_valid) {
-            double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
-            double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
-            s[tc][x] -= BETA * (left + right);
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l) {
+                    double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
+                    double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
+                    s[tc][x] -= BETA * (left + right);
+                }
+            }
         }
     }
     __syncthreads();
@@ -416,14 +524,19 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
     // Inv-step 5  (undo fwd-step 1):  odd −= α·(even_left+even_right)
     {
         const int tc = first_odd + 2 * yz_idx;
-        if (x_active && tc < n_valid) {
-            double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
-            double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
-            s[tc][x] -= ALPHA * (left + right);
+        if (tc < n_valid) {
+            for (int x = x_base; x < X_BATCH; x += T_Y) {
+                if (tile_x_start + x < nx_l) {
+                    double left  = (tc > 0)          ? s[tc - 1][x] : s[tc + 1][x];
+                    double right = (tc < n_valid - 1) ? s[tc + 1][x] : left;
+                    s[tc][x] -= ALPHA * (left + right);
+                }
+            }
         }
     }
     __syncthreads();
 
+    // ---- STORE: shared → global (identical to forward) ----
     for (int idx = tid; idx < X_BATCH * n_valid; idx += BLK_SIZE) {
         const int sx       = idx % X_BATCH;
         const int yz_store = idx / X_BATCH;
@@ -442,4 +555,4 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
     }
 }
 
-} 
+}  // namespace wavelet
