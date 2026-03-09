@@ -62,11 +62,20 @@ static void CompareBuffers(const double* ref, const double* test,
 // =============================================================================
 
 /// Returns true if the roundtrip error is within tolerance.
+/// Handles arbitrary (non-power-of-2) dimensions by padding to multiples of
+/// 2^levels with symmetric reflection, then cropping back after IDWT.
+/// Error is evaluated only on the original (unpadded) region.
 static bool RunRoundtrip(const int nx, const int ny, const int nz,
                          const int levels) {
-    const std::size_t total = static_cast<std::size_t>(nx) * ny * nz;
-    const int ldx = nx;
-    const int ldy = ny;
+    const bool is2d = (nz <= 1);
+    const std::size_t total = static_cast<std::size_t>(nx) * ny * std::max(nz, 1);
+
+    // Compute padded dimensions (multiples of 2^levels).
+    const int pnx = wavelet::dwt3d_padded_dim(nx, levels);
+    const int pny = wavelet::dwt3d_padded_dim(ny, levels);
+    const int pnz = is2d ? 1 : wavelet::dwt3d_padded_dim(nz, levels);
+    const bool needs_pad = (pnx != nx || pny != ny || pnz != nz);
+    const std::size_t pad_total = static_cast<std::size_t>(pnx) * pny * pnz;
 
     // Host buffers.
     std::vector<double> h_orig(total);
@@ -74,40 +83,63 @@ static bool RunRoundtrip(const int nx, const int ny, const int nz,
 
     FillRandom(h_orig.data(), total, /*seed=*/42u + nx + ny + nz + levels);
 
-    // Device buffer.
-    double* d_data = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_data, total * sizeof(double)));
-
-    // Copy original data to device.
-    CUDA_CHECK(cudaMemcpy(d_data, h_orig.data(), total * sizeof(double),
+    // Device buffers.
+    double* d_orig = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_orig, total * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_orig, h_orig.data(), total * sizeof(double),
                           cudaMemcpyHostToDevice));
 
-    // Forward DWT.
-    wavelet::dwt3d_forward(d_data, nx, ny, nz, levels, ldx, ldy);
+    double* d_data = nullptr;
+    if (needs_pad) {
+        CUDA_CHECK(cudaMalloc(&d_data, pad_total * sizeof(double)));
+        wavelet::dwt3d_reflect_pad(d_orig, d_data,
+                                   nx, ny, std::max(nz, 1),
+                                   pnx, pny, pnz);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } else {
+        CUDA_CHECK(cudaMalloc(&d_data, pad_total * sizeof(double)));
+        CUDA_CHECK(cudaMemcpy(d_data, d_orig, total * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+    }
+
+    // Forward DWT on padded data.
+    wavelet::dwt3d_forward(d_data, pnx, pny, pnz, levels, pnx, pny);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Inverse DWT.
-    wavelet::dwt3d_inverse(d_data, nx, ny, nz, levels, ldx, ldy);
+    // Inverse DWT on padded data.
+    wavelet::dwt3d_inverse(d_data, pnx, pny, pnz, levels, pnx, pny);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // Copy result back.
-    CUDA_CHECK(cudaMemcpy(h_result.data(), d_data, total * sizeof(double),
-                          cudaMemcpyDeviceToHost));
+    // Crop back to original dimensions.
+    if (needs_pad) {
+        double* d_cropped = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_cropped, total * sizeof(double)));
+        wavelet::dwt3d_crop(d_data, d_cropped,
+                            nx, ny, std::max(nz, 1),
+                            pnx, pny, pnz);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_result.data(), d_cropped,
+                              total * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaFree(d_cropped));
+    } else {
+        CUDA_CHECK(cudaMemcpy(h_result.data(), d_data,
+                              total * sizeof(double), cudaMemcpyDeviceToHost));
+    }
 
     CUDA_CHECK(cudaFree(d_data));
+    CUDA_CHECK(cudaFree(d_orig));
 
-    // Compare.
+    // Compare only the original region (not padded area).
     double max_abs = 0.0, max_rel = 0.0;
     CompareBuffers(h_orig.data(), h_result.data(), total, max_abs, max_rel);
 
-    // Tolerance: double-precision roundtrip should be ~1e-12 or better.
     constexpr double ABS_TOL = 1e-10;
     const bool pass = (max_abs < ABS_TOL);
 
-    std::printf("  %-20s  nx=%-4d ny=%-4d nz=%-4d levels=%d  "
+    std::printf("  %-20s  nx=%-4d ny=%-4d nz=%-4d  pad=%dx%dx%d  levels=%d  "
                 "max_abs=%.3e  max_rel=%.3e  %s\n",
                 pass ? "[PASS]" : "[FAIL]",
-                nx, ny, nz, levels,
+                nx, ny, nz, pnx, pny, pnz, levels,
                 max_abs, max_rel,
                 pass ? "" : "*** EXCEEDED TOLERANCE ***");
 
@@ -145,8 +177,15 @@ int main(int argc, char* argv[]) {
     // Test various sizes and levels.
     struct TestCase { int nx, ny, nz, levels; };
     const TestCase cases[] = {
+        // Power-of-2 sizes (classic)
         {256, 256, 256, 5},
         {512, 512, 512, 6},
+        // Non-power-of-2 sizes (exercise padding logic)
+        {100, 100, 100, 3},
+        {200, 150, 180, 4},
+        {300, 300, 1, 3},       // 2D non-pow2
+        {129, 65, 33, 2},
+        {80, 60, 40, 3},
     };
 
     for (const auto& tc : cases) {

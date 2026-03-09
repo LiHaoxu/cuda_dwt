@@ -1,4 +1,4 @@
-#include "cdf97_3d.cuh"
+#include "cdf97_3d.cuh"  // found via -I include/
 
 namespace wavelet {
 
@@ -172,6 +172,7 @@ __global__ void dwt3d_yz_pass(double* __restrict__ data,
 
     // ---- LOAD: global → shared (T_Y × T_X = 528 elements) ----
     // No halo: lc = tile_c_start + yz_in_tile  (no −1 offset).
+    // Column X_BATCH (= T_X-1) is bank-conflict padding — always zero, skip global read.
     for (int idx = tid; idx < T_Y * T_X; idx += BLK_SIZE) {
         const int x_in_tile  = idx % T_X;          // 0..32
         const int yz_in_tile = idx / T_X;          // 0..15
@@ -179,7 +180,7 @@ __global__ void dwt3d_yz_pass(double* __restrict__ data,
         const int lx = tile_x_start + x_in_tile;
         const int lc = tile_c_start + yz_in_tile;  // no halo offset
 
-        if (yz_in_tile < VPT && lx < nx_l && lc < n_compute) {
+        if (x_in_tile < X_BATCH && yz_in_tile < VPT && lx < nx_l && lc < n_compute) {
             int gx, gy, gz;
             if constexpr (AXIS == Axis::kY) {
                 gx = lx * step;  gy = lc * step;  gz = batch_idx * step;
@@ -441,7 +442,7 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
         const int lx = tile_x_start + x_in_tile;
         const int lc = tile_c_start + yz_in_tile;
 
-        if (yz_in_tile < VPT && lx < nx_l && lc < n_compute) {
+        if (x_in_tile < X_BATCH && yz_in_tile < VPT && lx < nx_l && lc < n_compute) {
             int gx, gy, gz;
             if constexpr (AXIS == Axis::kY) {
                 gx = lx * step;  gy = lc * step;  gz = batch_idx * step;
@@ -553,6 +554,50 @@ __global__ void idwt3d_yz_pass(double* __restrict__ data,
             data[Index3D(gx, gy, gz, ldx, ldy)] = s[yz_store][sx];
         }
     }
+}
+
+// =============================================================================
+// 3-D symmetric reflection padding kernel
+// =============================================================================
+
+__global__ void kernel_reflect_pad_3d(
+    const double* __restrict__ src, double* __restrict__ dst,
+    const int orig_nx, const int orig_ny, const int orig_nz,
+    const int pad_nx,  const int pad_ny,  const int pad_nz)
+{
+    size_t idx = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    size_t total = size_t(pad_nx) * pad_ny * pad_nz;
+    if (idx >= total) return;
+
+    int x = static_cast<int>(idx % pad_nx);
+    int y = static_cast<int>((idx / pad_nx) % pad_ny);
+    int z = static_cast<int>(idx / (size_t(pad_nx) * pad_ny));
+
+    int sx = ReflectIdx(x, orig_nx);
+    int sy = ReflectIdx(y, orig_ny);
+    int sz = ReflectIdx(z, orig_nz);
+
+    dst[idx] = src[size_t(sz) * orig_nx * orig_ny + size_t(sy) * orig_nx + sx];
+}
+
+// =============================================================================
+// 3-D crop kernel: extract original region from padded buffer
+// =============================================================================
+
+__global__ void kernel_crop_3d(
+    const double* __restrict__ src, double* __restrict__ dst,
+    const int orig_nx, const int orig_ny, const int orig_nz,
+    const int pad_nx,  const int pad_ny,  const int pad_nz)
+{
+    size_t idx = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    size_t total = size_t(orig_nx) * orig_ny * orig_nz;
+    if (idx >= total) return;
+
+    int x = static_cast<int>(idx % orig_nx);
+    int y = static_cast<int>((idx / orig_nx) % orig_ny);
+    int z = static_cast<int>(idx / (size_t(orig_nx) * orig_ny));
+
+    dst[idx] = src[size_t(z) * pad_nx * pad_ny + size_t(y) * pad_nx + x];
 }
 
 }  // namespace wavelet
